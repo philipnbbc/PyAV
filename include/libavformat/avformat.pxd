@@ -57,6 +57,7 @@ cdef extern from "libavformat/avformat.h" nogil:
         int direct
         int seekable
         int max_packet_size
+        void *opaque
 
     # http://ffmpeg.org/doxygen/trunk/structAVIOInterruptCB.html
     cdef struct AVIOInterruptCB:
@@ -187,6 +188,19 @@ cdef extern from "libavformat/avformat.h" nogil:
         int flags
         int64_t max_analyze_duration
 
+        void *opaque
+
+        int (*io_open)(
+            AVFormatContext *s,
+            AVIOContext **pb,
+            const char *url,
+            int flags,
+            AVDictionary **options
+        )
+        void (*io_close)(
+            AVFormatContext *s,
+            AVIOContext *pb
+        )
 
     cdef AVFormatContext* avformat_alloc_context()
 
@@ -250,6 +264,8 @@ cdef extern from "libavformat/avformat.h" nogil:
         AVCodecID codec_id,
         int std_compliance
     )
+
+    cdef void avio_flush(AVIOContext *s)
 
     cdef int avio_close(AVIOContext *s)
 

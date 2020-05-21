@@ -10,10 +10,11 @@ cimport libav as lib
 from av.container.core cimport timeout_info
 from av.container.input cimport InputContainer
 from av.container.output cimport OutputContainer
-from av.container.pyio cimport pyio_read, pyio_seek, pyio_write
+from av.container.pyio cimport pyio_close_custom_gil, pyio_close_gil
 from av.enum cimport define_enum
 from av.error cimport err_check, stash_exception
 from av.format cimport build_container_format
+from av.utils cimport avdict_to_dict
 
 from av.dictionary import Dictionary
 from av.logging import Capture as LogCapture
@@ -49,6 +50,77 @@ cdef int interrupt_cb (void *p) nogil:
         return 1
 
     return 0
+
+
+cdef int pyav_io_open(lib.AVFormatContext *s,
+                      lib.AVIOContext **pb,
+                      const char *url,
+                      int flags,
+                      lib.AVDictionary **options) nogil:
+    with gil:
+        return pyav_io_open_gil(s, pb, url, flags, options)
+
+
+cdef int pyav_io_open_gil(lib.AVFormatContext *s,
+                          lib.AVIOContext **pb,
+                          const char *url,
+                          int flags,
+                          lib.AVDictionary **options):
+    cdef Container container
+    cdef object file
+    cdef PyIOFile pyio_file
+    try:
+        container = <Container>dereference(s).opaque
+
+        file = container.io_open(
+            <str>url if url is not NULL else "",
+            flags,
+            avdict_to_dict(
+                dereference(<lib.AVDictionary**>options),
+                encoding=container.metadata_encoding,
+                errors=container.metadata_errors
+            )
+        )
+
+        pyio_file = PyIOFile(
+            file,
+            container.buffer_size,
+            (flags & lib.AVIO_FLAG_WRITE) != 0
+        )
+
+        # Add it to the container to avoid it being deallocated
+        container.open_files[<int64_t>pyio_file.iocontext.opaque] = pyio_file
+
+        pb[0] = pyio_file.iocontext
+        return 0
+
+    except Exception as e:
+        return stash_exception()
+
+
+cdef void pyav_io_close(lib.AVFormatContext *s,
+                        lib.AVIOContext *pb) nogil:
+    with gil:
+        pyav_io_close_gil(s, pb)
+
+
+cdef void pyav_io_close_gil(lib.AVFormatContext *s,
+                            lib.AVIOContext *pb):
+    cdef Container container
+    try:
+        container = <Container>dereference(s).opaque
+
+        if container.open_files is not None and <int64_t>pb.opaque in container.open_files:
+            pyio_close_custom_gil(pb)
+
+            # Remove it from the container so that it can be deallocated
+            del container.open_files[<int64_t>pb.opaque]
+            pb.opaque = NULL
+        else:
+            pyio_close_gil(pb)
+
+    except Exception as e:
+        stash_exception()
 
 
 Flags = define_enum('Flags', __name__, (
@@ -101,7 +173,8 @@ cdef class Container(object):
     def __cinit__(self, sentinel, file_, format_name, options,
                   container_options, stream_options,
                   metadata_encoding, metadata_errors,
-                  buffer_size, open_timeout, read_timeout):
+                  buffer_size, open_timeout, read_timeout,
+                  io_open):
 
         if sentinel is not _cinit_sentinel:
             raise RuntimeError('cannot construct base Container')
@@ -116,7 +189,6 @@ cdef class Container(object):
             self.name = getattr(file_, 'name', '<none>')
             if not isinstance(self.name, str):
                 raise TypeError("File's name attribute must be string-like.")
-            self.file = file_
 
         self.options = dict(options or ())
         self.container_options = dict(container_options or ())
@@ -127,6 +199,9 @@ cdef class Container(object):
 
         self.open_timeout = open_timeout
         self.read_timeout = read_timeout
+
+        self.buffer_size = buffer_size
+        self.io_open = io_open
 
         if format_name is not None:
             self.format = ContainerFormat(format_name)
@@ -166,44 +241,18 @@ cdef class Container(object):
 
         self.ptr.flags |= lib.AVFMT_FLAG_GENPTS
         self.ptr.max_analyze_duration = 10000000
+        self.ptr.opaque = <void*>self
 
         # Setup Python IO.
-        if self.file is not None:
+        self.open_files = {}
+        if not isinstance(file_, basestring):
 
-            self.fread = getattr(self.file, 'read', None)
-            self.fwrite = getattr(self.file, 'write', None)
-            self.fseek = getattr(self.file, 'seek', None)
-            self.ftell = getattr(self.file, 'tell', None)
+            self.file = PyIOFile(file_, buffer_size, self.writeable)
+            self.ptr.pb = self.file.iocontext
 
-            if self.writeable:
-                if self.fwrite is None:
-                    raise ValueError("File object has no write method.")
-            else:
-                if self.fread is None:
-                    raise ValueError("File object has no read method.")
-
-            if self.fseek is not None and self.ftell is not None:
-                seek_func = pyio_seek
-
-            self.pos = 0
-            self.pos_is_valid = True
-
-            # This is effectively the maximum size of reads.
-            self.buffer = <unsigned char*>lib.av_malloc(buffer_size)
-
-            self.iocontext = lib.avio_alloc_context(
-                self.buffer, buffer_size,
-                self.writeable,  # Writeable.
-                <void*>self,  # User data.
-                pyio_read,
-                pyio_write,
-                seek_func
-            )
-
-            if seek_func:
-                self.iocontext.seekable = lib.AVIO_SEEKABLE_NORMAL
-            self.iocontext.max_packet_size = buffer_size
-            self.ptr.pb = self.iocontext
+        if io_open is not None:
+            self.ptr.io_open = pyav_io_open
+            self.ptr.io_close = pyav_io_close
 
         cdef lib.AVInputFormat *ifmt
         cdef _Dictionary c_options
@@ -231,18 +280,7 @@ cdef class Container(object):
 
     def __dealloc__(self):
         with nogil:
-            # FFmpeg will not release custom input, so it's up to us to free it.
-            # Do not touch our original buffer as it may have been freed and replaced.
-            if self.iocontext:
-                lib.av_freep(&self.iocontext.buffer)
-                lib.av_freep(&self.iocontext)
-
-            # We likely errored badly if we got here, and so are still
-            # responsible for our buffer.
-            else:
-                lib.av_freep(&self.buffer)
-
-            # Finish releasing the whole structure.
+            # Releasing the whole structure.
             lib.avformat_free_context(self.ptr)
 
     def __enter__(self):
@@ -306,7 +344,7 @@ cdef class Container(object):
 def open(file, mode=None, format=None, options=None,
          container_options=None, stream_options=None,
          metadata_encoding='utf-8', metadata_errors='strict',
-         buffer_size=32768, timeout=None):
+         buffer_size=32768, timeout=None, io_open=None):
     """open(file, mode='r', **kwargs)
 
     Main entrypoint to opening files/streams.
@@ -356,7 +394,8 @@ def open(file, mode=None, format=None, options=None,
             _cinit_sentinel, file, format, options,
             container_options, stream_options,
             metadata_encoding, metadata_errors,
-            buffer_size, open_timeout, read_timeout
+            buffer_size, open_timeout, read_timeout,
+            io_open
         )
     if mode.startswith('w'):
         if stream_options:
@@ -365,6 +404,7 @@ def open(file, mode=None, format=None, options=None,
             _cinit_sentinel, file, format, options,
             container_options, stream_options,
             metadata_encoding, metadata_errors,
-            buffer_size, open_timeout, read_timeout
+            buffer_size, open_timeout, read_timeout,
+            io_open
         )
     raise ValueError("mode must be 'r' or 'w'; got %r" % mode)
